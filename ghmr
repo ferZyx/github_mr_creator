@@ -1,0 +1,410 @@
+#!/bin/sh
+
+set -u
+
+SCRIPT_NAME=${0##*/}
+CACHE_DIR=${GHMR_CACHE_DIR:-${XDG_CACHE_HOME:-"$HOME/.cache"}/ghmr}
+CACHE_FILE="$CACHE_DIR/default-branches.tsv"
+
+TARGET_BRANCH=""
+TITLE=""
+DRAFT=0
+DRY_RUN=0
+REFRESH_CACHE=0
+NO_CACHE=0
+CLEAR_CACHE=0
+OPEN_WEB=0
+
+usage() {
+  cat <<'EOF'
+ghmr - создать GitHub PR из текущей git-ветки.
+
+Использование:
+  ghmr
+  ghmr --target release
+  ghmr --title "P-2081: fix" --draft
+
+Что делает:
+  - находит git-root и origin GitHub repo;
+  - проверяет текущую ветку;
+  - предлагает target: основная ветка GitHub repo + test дополнительным вариантом;
+  - кэширует основную ветку в ~/.cache/ghmr/default-branches.tsv;
+  - проверяет, что source branch запушена, и предлагает push;
+  - показывает подтверждение;
+  - создает PR через gh CLI без assignee/reviewer.
+
+Опции:
+  -t, --target BRANCH     Не спрашивать target, использовать BRANCH.
+  -T, --title TITLE       Заголовок PR. По умолчанию: последний commit subject.
+      --draft             Создать draft PR.
+      --web               Открыть PR в браузере после создания.
+      --dry-run           Ничего не создавать, только показать параметры.
+      --refresh-cache     Заново получить default branch из GitHub и обновить кэш.
+      --no-cache          Не читать и не писать кэш default branch.
+      --clear-cache       Удалить кэш ghmr и выйти.
+  -h, --help              Показать help.
+EOF
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'WARN: %s\n' "$*" >&2
+}
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "Не найдена команда '$1'."
+}
+
+confirm() {
+  prompt=$1
+  default=${2:-N}
+
+  if [ ! -t 0 ]; then
+    fail "Нужен интерактивный терминал для подтверждения: $prompt"
+  fi
+
+  printf '%s ' "$prompt"
+  IFS= read -r answer
+  case "$answer" in
+    y|Y|yes|YES|Yes|д|Д|да|Да|ДА)
+      return 0
+      ;;
+    "")
+      [ "$default" = "Y" ] && return 0
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+parse_github_repo() {
+  url=$1
+
+  case "$url" in
+    git@github.com:*)
+      path=${url#git@github.com:}
+      ;;
+    ssh://git@github.com/*)
+      path=${url#ssh://git@github.com/}
+      ;;
+    https://github.com/*)
+      path=${url#https://github.com/}
+      ;;
+    http://github.com/*)
+      path=${url#http://github.com/}
+      ;;
+    git://github.com/*)
+      path=${url#git://github.com/}
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  path=${path%.git}
+  path=$(printf '%s\n' "$path" | sed 's#/*$##')
+
+  case "$path" in
+    */*) printf '%s\n' "$path" ;;
+    *) return 1 ;;
+  esac
+}
+
+cache_get_default_branch() {
+  repo=$1
+
+  [ "$NO_CACHE" -eq 1 ] && return 1
+  [ "$REFRESH_CACHE" -eq 1 ] && return 1
+  [ -f "$CACHE_FILE" ] || return 1
+
+  awk -F '\t' -v repo="$repo" '
+    $1 == repo && $2 != "" { value = $2 }
+    END { if (value != "") print value }
+  ' "$CACHE_FILE"
+}
+
+cache_set_default_branch() {
+  repo=$1
+  branch=$2
+
+  [ "$NO_CACHE" -eq 1 ] && return 0
+  [ -n "$branch" ] || return 0
+
+  mkdir -p "$CACHE_DIR" || fail "Не удалось создать директорию кэша: $CACHE_DIR"
+  tmp="$CACHE_FILE.tmp.$$"
+
+  {
+    if [ -f "$CACHE_FILE" ]; then
+      awk -F '\t' -v repo="$repo" '$1 != repo { print $0 }' "$CACHE_FILE"
+    fi
+    printf '%s\t%s\t%s\n' "$repo" "$branch" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$tmp" || fail "Не удалось записать временный файл кэша."
+
+  mv "$tmp" "$CACHE_FILE" || fail "Не удалось обновить кэш: $CACHE_FILE"
+}
+
+remote_branch_exists_local() {
+  branch=$1
+  git show-ref --verify --quiet "refs/remotes/origin/$branch"
+}
+
+remote_branch_exists() {
+  branch=$1
+
+  remote_branch_exists_local "$branch" && return 0
+  git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1
+}
+
+discover_default_branch() {
+  repo=$1
+  cached=$(cache_get_default_branch "$repo" || true)
+
+  if [ -n "$cached" ]; then
+    info "Основная ветка из кэша: $cached"
+    DEFAULT_BRANCH=$cached
+    return 0
+  fi
+
+  info "Основная ветка не найдена в кэше, запрашиваю GitHub..."
+  branch=$(gh repo view "$repo" --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || true)
+
+  if [ -z "$branch" ]; then
+    warn "GitHub API не вернул default branch, пробую локальный origin/HEAD."
+    branch=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
+  fi
+
+  if [ -z "$branch" ]; then
+    for candidate in main release master; do
+      if remote_branch_exists "$candidate"; then
+        branch=$candidate
+        break
+      fi
+    done
+  fi
+
+  [ -n "$branch" ] || fail "Не удалось определить основную ветку для $repo."
+  cache_set_default_branch "$repo" "$branch"
+  info "Основная ветка сохранена в кэш: $branch"
+  DEFAULT_BRANCH=$branch
+}
+
+add_candidate() {
+  branch=$1
+
+  [ -n "$branch" ] || return 0
+  [ "$branch" = "$CURRENT_BRANCH" ] && return 0
+
+  if [ -n "$CANDIDATES" ]; then
+    printf '%s\n' "$CANDIDATES" | grep -Fx -- "$branch" >/dev/null 2>&1 && return 0
+    CANDIDATES="${CANDIDATES}
+$branch"
+  else
+    CANDIDATES=$branch
+  fi
+}
+
+choose_target_branch() {
+  if [ -n "$TARGET_BRANCH" ]; then
+    [ "$TARGET_BRANCH" != "$CURRENT_BRANCH" ] || fail "Source и target совпадают: $TARGET_BRANCH."
+    remote_branch_exists "$TARGET_BRANCH" || fail "Target branch '$TARGET_BRANCH' не найдена в origin."
+    return 0
+  fi
+
+  CANDIDATES=""
+  add_candidate "$DEFAULT_BRANCH"
+  if remote_branch_exists_local test; then
+    add_candidate test
+  fi
+
+  count=$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')
+  [ "$count" -gt 0 ] || fail "Нет подходящих target веток."
+
+  info "Текущая ветка: $CURRENT_BRANCH"
+  info "Выбери target branch. По умолчанию: $DEFAULT_BRANCH"
+  printf '%s\n' "$CANDIDATES" | awk 'NF { printf " [%d] %s\n", ++i, $0 }'
+
+  if [ ! -t 0 ]; then
+    fail "Нужен интерактивный терминал для выбора target branch."
+  fi
+
+  printf 'Номер [1]: '
+  IFS= read -r choice
+  if [ -z "$choice" ]; then
+    choice=1
+  fi
+  case "$choice" in
+    *[!0-9]*)
+      fail "Неверный выбор."
+      ;;
+  esac
+
+  [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "$count" ] 2>/dev/null || fail "Неверный выбор."
+  selected=$(printf '%s\n' "$CANDIDATES" | sed -n "${choice}p")
+  [ -n "$selected" ] || fail "Неверный выбор."
+  TARGET_BRANCH=$selected
+}
+
+ensure_current_branch_pushed() {
+  branch=$1
+
+  has_upstream=1
+  git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 || has_upstream=0
+
+  if [ "$has_upstream" -eq 0 ]; then
+    warn "Для ветки '$branch' не настроен upstream."
+    if confirm "Запушить сейчас? (git push -u origin $branch) [y/N]" N; then
+      git push -u origin "$branch" || fail "git push не удался."
+    else
+      fail "Ветка не запушена, PR создавать нельзя."
+    fi
+  fi
+
+  if ! remote_branch_exists "$branch"; then
+    warn "Ветка '$branch' не найдена в origin."
+    if confirm "Запушить сейчас? (git push -u origin $branch) [y/N]" N; then
+      git push -u origin "$branch" || fail "git push не удался."
+    else
+      fail "Ветка не запушена, PR создавать нельзя."
+    fi
+  fi
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -t|--target)
+      [ "$#" -ge 2 ] || fail "Для $1 нужно значение."
+      TARGET_BRANCH=$2
+      shift 2
+      ;;
+    --target=*)
+      TARGET_BRANCH=${1#*=}
+      shift
+      ;;
+    -T|--title)
+      [ "$#" -ge 2 ] || fail "Для $1 нужно значение."
+      TITLE=$2
+      shift 2
+      ;;
+    --title=*)
+      TITLE=${1#*=}
+      shift
+      ;;
+    --draft)
+      DRAFT=1
+      shift
+      ;;
+    --web)
+      OPEN_WEB=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --refresh-cache)
+      REFRESH_CACHE=1
+      shift
+      ;;
+    --no-cache)
+      NO_CACHE=1
+      shift
+      ;;
+    --clear-cache)
+      CLEAR_CACHE=1
+      shift
+      ;;
+    *)
+      fail "Неизвестный параметр: $1"
+      ;;
+  esac
+done
+
+if [ "$CLEAR_CACHE" -eq 1 ]; then
+  rm -f "$CACHE_FILE"
+  info "Кэш удален: $CACHE_FILE"
+  exit 0
+fi
+
+need_cmd git
+need_cmd gh
+
+gh auth status --hostname github.com >/dev/null 2>&1 || fail "gh не авторизован в github.com. Выполни: gh auth login"
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail "Не похоже на git-репозиторий."
+cd "$REPO_ROOT" || fail "Не удалось перейти в git-root: $REPO_ROOT"
+
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || true)
+if [ -z "$CURRENT_BRANCH" ]; then
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+fi
+[ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "HEAD" ] || fail "Сейчас detached HEAD. Переключись на ветку."
+
+ORIGIN_URL=$(git remote get-url origin 2>/dev/null) || fail "Не найден remote origin."
+REPO=$(parse_github_repo "$ORIGIN_URL") || fail "origin не похож на GitHub URL: $ORIGIN_URL"
+
+ensure_current_branch_pushed "$CURRENT_BRANCH"
+
+DEFAULT_BRANCH=""
+if [ -z "$TARGET_BRANCH" ]; then
+  discover_default_branch "$REPO"
+fi
+choose_target_branch
+
+if [ -z "$TITLE" ]; then
+  TITLE=$(git log -1 --pretty=format:%s 2>/dev/null || true)
+fi
+[ -n "$TITLE" ] || TITLE="$CURRENT_BRANCH -> $TARGET_BRANCH"
+
+info ""
+info "Создать GitHub PR?"
+info "  Repo:       $REPO"
+info "  Source:     $CURRENT_BRANCH"
+info "  Target:     $TARGET_BRANCH"
+info "  Title:      $TITLE"
+info "  Draft:      $DRAFT"
+info "  Cache:      $CACHE_FILE"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  info ""
+  info "Dry run: PR не создан."
+  exit 0
+fi
+
+if ! confirm "[y/N]" N; then
+  info "Создание PR отменено."
+  exit 0
+fi
+
+EXISTING_PR_URL=$(gh pr list --repo "$REPO" --head "$CURRENT_BRANCH" --state open --json url -q '.[0].url' 2>/dev/null || true)
+if [ -n "$EXISTING_PR_URL" ]; then
+  info "Для ветки уже есть открытый PR:"
+  info "$EXISTING_PR_URL"
+  exit 0
+fi
+
+if [ "$DRAFT" -eq 1 ]; then
+  PR_URL=$(gh pr create --repo "$REPO" --base "$TARGET_BRANCH" --head "$CURRENT_BRANCH" --title "$TITLE" --body "" --draft) || fail "Не удалось создать PR."
+else
+  PR_URL=$(gh pr create --repo "$REPO" --base "$TARGET_BRANCH" --head "$CURRENT_BRANCH" --title "$TITLE" --body "") || fail "Не удалось создать PR."
+fi
+
+info ""
+info "PR создан: $PR_URL"
+
+if [ "$OPEN_WEB" -eq 1 ]; then
+  gh pr view --repo "$REPO" "$PR_URL" --web >/dev/null 2>&1 || true
+fi
